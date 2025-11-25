@@ -1,5 +1,5 @@
 // =======================
-//  SERVER.JS — FINAL PRO
+//  SERVER.JS — FINAL PRO (Zomato Popup Optimized)
 // =======================
 
 const express = require("express");
@@ -74,9 +74,9 @@ const SSE_URL =
 let reconnectDelay = 2000;
 const MAX_DELAY = 60000;
 
-// ================================
-//  SEND ZOMATO STYLE NOTIFICATION
-// ================================
+// =====================================
+//  SEND HIGH PRIORITY (ZOMATO STYLE) PUSH
+// =====================================
 async function handleLeadEvent(data) {
   const leadName = data?.name || "New Lead";
   const phone = data?.phone || "N/A";
@@ -92,26 +92,51 @@ async function handleLeadEvent(data) {
 
   const message = {
     notification: {
-      title: `🔥 NEW HOT LEAD from ${source}`,
+      title: `🔥 New Hot Lead (${source})`,
       body: `${leadName} — ${phone} — ${property}`,
-      image: "https://catination.com/assets/lead-banner.png",
+      image: "https://catination.com/assets/lead-banner.png"
     },
+
     data: {
       leadId,
       name: leadName,
       phone,
-      property,
+      property
     },
+
+    // ANDROID HIGH PRIORITY (POP-UP, SOUND)
     android: {
       priority: "high",
       notification: {
         sound: "default",
+        channelId: "catination_high_priority",
         imageUrl: "https://catination.com/assets/lead-banner.png",
-        vibrateTimings: ["0.2s", "0.1s", "0.2s"],
-        defaultVibrateTimings: true,
-      },
+        vibrateTimingsMillis: [200, 100, 200, 100, 200],
+        priority: "HIGH"
+      }
     },
-    tokens: tokensArr,
+
+    // BROWSER POP-UP (HEAD-UP LIKE ZOMATO)
+    webpush: {
+      headers: {
+        Urgency: "high"           // ← CRITICAL for popup
+      },
+      notification: {
+        title: `🔥 New Hot Lead (${source})`,
+        body: `${leadName} — ${phone} — ${property}`,
+        icon: "/catination-app-logo.png",
+        badge: "/catination-app-logo.png",
+        requireInteraction: true,
+        vibrate: [200, 100, 200],
+        renotify: true,
+        tag: "catination-hot-lead",
+      },
+      fcmOptions: {
+        link: `/dashboard/lead-management?leadId=${leadId}`
+      }
+    },
+
+    tokens: tokensArr
   };
 
   try {
