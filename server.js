@@ -15,7 +15,31 @@ if (typeof fetch === "undefined") {
 }
 
 const app = express();
-app.use(cors());
+
+// --------- CORS (adjust origins as needed) ----------
+const ALLOWED_ORIGINS = [
+  "http://localhost:5173",
+  "http://localhost:3000",
+  "https://app.catination.com",
+  "https://catination.com",
+  "https://notification-catination.onrender.com"
+];
+app.use(
+  cors({
+    origin: function (origin, callback) {
+      // allow requests with no origin (like curl, server-to-server)
+      if (!origin) return callback(null, true);
+      if (ALLOWED_ORIGINS.indexOf(origin) !== -1) {
+        return callback(null, true);
+      } else {
+        return callback(new Error("CORS policy: Origin not allowed"));
+      }
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+    credentials: true,
+  })
+);
+
 app.use(express.json());
 
 // ---------------- FIREBASE CREDENTIALS ----------------
@@ -33,12 +57,12 @@ admin.initializeApp({
 });
 
 // ---------------- TOKEN STORE ----------------
+// Use a Set for in-memory demo. In production persist tokens to DB.
 let tokens = new Set();
 
 // Register token
 app.post("/register-token", (req, res) => {
   const { token } = req.body;
-
   if (!token) return res.status(400).json({ error: "token required" });
 
   tokens.add(token);
@@ -51,9 +75,10 @@ app.post("/register-token", (req, res) => {
 // Remove token (logout)
 app.post("/remove-token", (req, res) => {
   const { token } = req.body;
-  if (token) tokens.delete(token);
-
-  console.log("❌ Token removed:", token);
+  if (token) {
+    tokens.delete(token);
+    console.log("❌ Token removed:", token);
+  }
   res.json({ success: true });
 });
 
@@ -68,6 +93,7 @@ app.get("/", (req, res) => {
 });
 
 // ---------------- SSE STREAM URL ----------------
+// (Keep your SSE URL here — this server will connect and forward leads to FCM)
 const SSE_URL =
   "https://api.catination.com/service/notifications/stream?tenantId=29ABCDE1234F2Z5&streamKey=HelloAryan";
 
@@ -90,11 +116,19 @@ async function handleLeadEvent(data) {
     return;
   }
 
+  // NOTE: Use absolute URLs for icons/badges. Relative paths often break in PWA context.
+  const ICON_URL = "https://app.catination.com/catination-app-logo.png";
+  const BADGE_URL = "https://app.catination.com/catination-app-logo.png";
+
+  const title = `🔥 New Hot Lead (${source})`;
+  const body = `${leadName} — ${phone} — ${property}`;
+
+  // Build message payload — webpush + android + data
   const message = {
     notification: {
-      title: `🔥 New Hot Lead (${source})`,
-      body: `${leadName} — ${phone} — ${property}`,
-      image: "https://catination.com/assets/lead-banner.png"
+      // Top-level notification is optional for web; kept for completeness
+      title,
+      body
     },
 
     data: {
@@ -104,53 +138,61 @@ async function handleLeadEvent(data) {
       property
     },
 
-    // ANDROID HIGH PRIORITY (POP-UP, SOUND)
+    // ANDROID: high priority, sound, channel id (channel must be created by system — SW triggers)
     android: {
       priority: "high",
       notification: {
-        sound: "default",
         channelId: "catination_high_priority",
-        imageUrl: "https://catination.com/assets/lead-banner.png",
+        sound: "default",
+        // vibrateTimingsMillis expects array of numbers (ms)
         vibrateTimingsMillis: [200, 100, 200, 100, 200],
+        // imageUrl is supported on Android native clients
+        imageUrl: "https://catination.com/assets/lead-banner.png",
+        // set priority for Android notification
         priority: "HIGH"
       }
     },
 
-    // BROWSER POP-UP (HEAD-UP LIKE ZOMATO)
+    // WEBPUSH: critical for browser push behaviour. Urgency must be "high".
     webpush: {
       headers: {
-        Urgency: "high"           // ← CRITICAL for popup
+        Urgency: "high"
       },
       notification: {
-        title: `🔥 New Hot Lead (${source})`,
-        body: `${leadName} — ${phone} — ${property}`,
-        icon: "/catination-app-logo.png",
-        badge: "/catination-app-logo.png",
+        title,
+        body,
+        icon: ICON_URL,
+        badge: BADGE_URL,
         requireInteraction: true,
-        vibrate: [200, 100, 200],
+        vibrate: [200, 100, 200, 100, 200],
         renotify: true,
-        tag: "catination-hot-lead",
+        // NOTE: Chrome does not play custom sound from webpush; 'sound' helps FCM treat it high-priority
+        sound: "default",
+        tag: "catination-hot-lead"
       },
       fcmOptions: {
-        link: `/dashboard/lead-management?leadId=${leadId}`
+        // absolute link — relative may not work when opened from notification
+        link: `https://app.catination.com/dashboard/lead-management?leadId=${leadId}`
       }
     },
 
+    // tokens to send to
     tokens: tokensArr
   };
 
   try {
+    // sendEachForMulticast expects message with 'tokens' property (array)
     const result = await admin.messaging().sendEachForMulticast(message);
 
     console.log(
       `📨 Push sent → Success: ${result.successCount}, Failed: ${result.failureCount}`
     );
 
-    // Remove bad/expired tokens
+    // Remove invalid tokens reported by FCM
     result.responses.forEach((r, i) => {
       if (!r.success) {
         const t = tokensArr[i];
-        console.log("❌ Removing invalid token:", t);
+        console.log("❌ Removing invalid token:", t, "error:", r.error?.code || r.error);
         tokens.delete(t);
       }
     });
@@ -233,6 +275,26 @@ async function startSSE() {
 
 // Start SSE listener
 startSSE();
+
+// -------------------
+// Test route (manual)
+// -------------------
+// Call http://localhost:3000/test to send a test push (useful for debugging)
+app.get("/test", async (req, res) => {
+  try {
+    await handleLeadEvent({
+      name: "Test Lead",
+      phone: "9999999999",
+      propertyName: "Demo Property",
+      leadId: "TEST123",
+      source: "ManualTest"
+    });
+    return res.send("Test notification sent (check devices).");
+  } catch (err) {
+    console.error("Test send error:", err);
+    return res.status(500).send("Test failed");
+  }
+});
 
 // ---------------- EXPRESS SERVER ----------------
 const PORT = process.env.PORT || 3000;
