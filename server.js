@@ -1,5 +1,5 @@
 // =======================
-//  SERVER.JS — FINAL PRO (Zomato Popup Optimized)
+//  SERVER.JS — FINAL ZOMATO POPUP VERSION
 // =======================
 
 const express = require("express");
@@ -16,25 +16,16 @@ if (typeof fetch === "undefined") {
 
 const app = express();
 
-// --------- CORS (adjust origins as needed) ----------
-const ALLOWED_ORIGINS = [
-  "http://localhost:5173",
-  "http://localhost:3000",
-  "https://app.catination.com",
-  "https://catination.com",
-  "https://notification-catination.onrender.com"
-];
+// --------- CORS ----------
 app.use(
   cors({
-    origin: function (origin, callback) {
-      // allow requests with no origin (like curl, server-to-server)
-      if (!origin) return callback(null, true);
-      if (ALLOWED_ORIGINS.indexOf(origin) !== -1) {
-        return callback(null, true);
-      } else {
-        return callback(new Error("CORS policy: Origin not allowed"));
-      }
-    },
+    origin: [
+      "http://localhost:5173",
+      "http://localhost:3000",
+      "https://app.catination.com",
+      "https://catination.com",
+      "https://notification-catination.onrender.com"
+    ],
     methods: ["GET", "POST", "OPTIONS"],
     credentials: true,
   })
@@ -57,10 +48,8 @@ admin.initializeApp({
 });
 
 // ---------------- TOKEN STORE ----------------
-// Use a Set for in-memory demo. In production persist tokens to DB.
 let tokens = new Set();
 
-// Register token
 app.post("/register-token", (req, res) => {
   const { token } = req.body;
   if (!token) return res.status(400).json({ error: "token required" });
@@ -72,7 +61,6 @@ app.post("/register-token", (req, res) => {
   res.json({ success: true });
 });
 
-// Remove token (logout)
 app.post("/remove-token", (req, res) => {
   const { token } = req.body;
   if (token) {
@@ -82,27 +70,22 @@ app.post("/remove-token", (req, res) => {
   res.json({ success: true });
 });
 
-// List tokens (debug)
 app.get("/tokens", (req, res) => {
   res.json({ tokens: Array.from(tokens) });
 });
 
-// ---------------- ROOT CHECK URL ----------------
-app.get("/", (req, res) => {
-  res.send("Hi there, I am active! 🚀");
-});
-
-// ---------------- SSE STREAM URL ----------------
-// (Keep your SSE URL here — this server will connect and forward leads to FCM)
+// ----------------------------------------------------
+// SSE URL — LEADS STREAM
+// ----------------------------------------------------
 const SSE_URL =
   "https://api.catination.com/service/notifications/stream?tenantId=29ABCDE1234F2Z5&streamKey=HelloAryan";
 
 let reconnectDelay = 2000;
 const MAX_DELAY = 60000;
 
-// =====================================
-//  SEND HIGH PRIORITY (ZOMATO STYLE) PUSH
-// =====================================
+// ======================================================
+//  SEND HIGH PRIORITY ZOMATO STYLE PUSH NOTIFICATION
+// ======================================================
 async function handleLeadEvent(data) {
   const leadName = data?.name || "New Lead";
   const phone = data?.phone || "N/A";
@@ -116,17 +99,15 @@ async function handleLeadEvent(data) {
     return;
   }
 
-  // NOTE: Use absolute URLs for icons/badges. Relative paths often break in PWA context.
   const ICON_URL = "https://app.catination.com/catination-app-logo.png";
-  const BADGE_URL = "https://app.catination.com/catination-app-logo.png";
+  const BADGE_URL = ICON_URL;
 
   const title = `🔥 New Hot Lead (${source})`;
   const body = `${leadName} — ${phone} — ${property}`;
 
-  // Build message payload — webpush + android + data
+  // FINAL FIXED MESSAGE
   const message = {
     notification: {
-      // Top-level notification is optional for web; kept for completeness
       title,
       body
     },
@@ -138,22 +119,17 @@ async function handleLeadEvent(data) {
       property
     },
 
-    // ANDROID: high priority, sound, channel id (channel must be created by system — SW triggers)
+    // ANDROID (ignored by Chrome, safe but not required)
     android: {
       priority: "high",
       notification: {
         channelId: "catination_high_priority",
         sound: "default",
-        // vibrateTimingsMillis expects array of numbers (ms)
-        vibrateTimingsMillis: [200, 100, 200, 100, 200],
-        // imageUrl is supported on Android native clients
-        imageUrl: "https://catination.com/assets/lead-banner.png",
-        // set priority for Android notification
-        priority: "HIGH"
+        vibrateTimingsMillis: [200, 100, 200, 100, 200]
       }
     },
 
-    // WEBPUSH: critical for browser push behaviour. Urgency must be "high".
+    // WEB PUSH — THE IMPORTANT PART
     webpush: {
       headers: {
         Urgency: "high"
@@ -164,35 +140,30 @@ async function handleLeadEvent(data) {
         icon: ICON_URL,
         badge: BADGE_URL,
         requireInteraction: true,
-        vibrate: [200, 100, 200, 100, 200],
         renotify: true,
-        // NOTE: Chrome does not play custom sound from webpush; 'sound' helps FCM treat it high-priority
-        sound: "default",
-        tag: "catination-hot-lead"
+        vibrate: [200, 100, 200, 100, 200],
+        tag: "catination_high_priority",  // FIXED
+        sound: "default"
       },
       fcmOptions: {
-        // absolute link — relative may not work when opened from notification
         link: `https://app.catination.com/dashboard/lead-management?leadId=${leadId}`
       }
     },
 
-    // tokens to send to
     tokens: tokensArr
   };
 
   try {
-    // sendEachForMulticast expects message with 'tokens' property (array)
     const result = await admin.messaging().sendEachForMulticast(message);
 
     console.log(
       `📨 Push sent → Success: ${result.successCount}, Failed: ${result.failureCount}`
     );
 
-    // Remove invalid tokens reported by FCM
     result.responses.forEach((r, i) => {
       if (!r.success) {
         const t = tokensArr[i];
-        console.log("❌ Removing invalid token:", t, "error:", r.error?.code || r.error);
+        console.log("❌ Removing invalid token:", t);
         tokens.delete(t);
       }
     });
@@ -201,9 +172,9 @@ async function handleLeadEvent(data) {
   }
 }
 
-// =======================
-//  CONNECT TO SSE STREAM
-// =======================
+// ======================================================
+//  CONNECT TO SSE
+// ======================================================
 async function startSSE() {
   console.log("🔌 Connecting to SSE:", SSE_URL);
 
@@ -273,28 +244,8 @@ async function startSSE() {
   }
 }
 
-// Start SSE listener
+// Start SSE
 startSSE();
-
-// -------------------
-// Test route (manual)
-// -------------------
-// Call http://localhost:3000/test to send a test push (useful for debugging)
-app.get("/test", async (req, res) => {
-  try {
-    await handleLeadEvent({
-      name: "Test Lead",
-      phone: "9999999999",
-      propertyName: "Demo Property",
-      leadId: "TEST123",
-      source: "ManualTest"
-    });
-    return res.send("Test notification sent (check devices).");
-  } catch (err) {
-    console.error("Test send error:", err);
-    return res.status(500).send("Test failed");
-  }
-});
 
 // ---------------- EXPRESS SERVER ----------------
 const PORT = process.env.PORT || 3000;
