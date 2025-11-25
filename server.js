@@ -62,6 +62,11 @@ app.get("/tokens", (req, res) => {
   res.json({ tokens: Array.from(tokens) });
 });
 
+// ---------------- ROOT CHECK URL ----------------
+app.get("/", (req, res) => {
+  res.send("Hi there, I am active! 🚀");
+});
+
 // ---------------- SSE STREAM URL ----------------
 const SSE_URL =
   "https://api.catination.com/service/notifications/stream?tenantId=29ABCDE1234F2Z5&streamKey=HelloAryan";
@@ -205,7 +210,7 @@ async function startSSE() {
 startSSE();
 
 // ---------------- EXPRESS SERVER ----------------
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Push Server LIVE at http://localhost:${PORT}`);
 });
