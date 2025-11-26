@@ -1,24 +1,31 @@
 /**
- * server.js — Catination Push Server (FINAL & FULLY FIXED)
+ * Catination Push Server — FINAL 2025 VERSION
+ * Supports:
+ *  • FCM Token Registration (LOCAL + PROD)
+ *  • SSE Lead Listener
+ *  • Push Notifications
+ *  • Admin + Employee Logic
+ *  • Full Console Logs
  */
 
 require("dotenv").config();
-const fs = require("fs");
-const path = require("path");
 const express = require("express");
 const cors = require("cors");
 const mongoose = require("mongoose");
 const admin = require("firebase-admin");
 const Token = require("./models/Token");
 
-// node-fetch polyfill for older node versions where fetch isn't present
+// Node 18+ fetch fix
 if (typeof fetch === "undefined") {
   global.fetch = require("node-fetch");
 }
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 
+// ---------------------------------------------------------
+// CORS CONFIG (Supports Local + Production)
+// ---------------------------------------------------------
 app.use(
   cors({
     origin: [
@@ -34,50 +41,54 @@ app.use(
 );
 
 // ---------------------------------------------------------
-// ENV CONFIG
+// ENV VALIDATION
 // ---------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 const MONGO_URI = process.env.MONGO_URI;
-const SSE_URL = process.env.SSE_URL || "";
-const FIREBASE_SERVICE_ACCOUNT_PATH =
-  process.env.FIREBASE_SERVICE_ACCOUNT_PATH || "serviceAccountKey.json";
+const SSE_URL = process.env.SSE_URL;
+const FIREBASE_JSON = process.env.FIREBASE_SERVICE_ACCOUNT;
 
 if (!MONGO_URI) {
-  console.error("❌ MONGO_URI missing from .env");
+  console.error("❌ ERROR: MONGO_URI missing in .env");
+  process.exit(1);
+}
+if (!FIREBASE_JSON) {
+  console.error("❌ ERROR: FIREBASE_SERVICE_ACCOUNT missing in .env");
   process.exit(1);
 }
 
 // ---------------------------------------------------------
-// FIREBASE ADMIN INIT
+// FIREBASE ADMIN INITIALIZATION
 // ---------------------------------------------------------
-const saPath = path.join(__dirname, FIREBASE_SERVICE_ACCOUNT_PATH);
-if (!fs.existsSync(saPath)) {
-  console.error("❌ Firebase service account file missing:", saPath);
+let serviceAccount = null;
+
+try {
+  serviceAccount = JSON.parse(FIREBASE_JSON);
+} catch (err) {
+  console.error("❌ FIREBASE JSON PARSE ERROR:", err);
   process.exit(1);
 }
-
-const serviceAccount = require(saPath);
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
-console.log("✅ Firebase admin initialized");
+console.log("✅ Firebase Admin Initialized");
 
 // ---------------------------------------------------------
-// MONGO INIT
+// MONGO CONNECTION
 // ---------------------------------------------------------
 mongoose.set("strictQuery", false);
 
 mongoose
   .connect(MONGO_URI)
-  .then(() => console.log("✅ MongoDB connected"))
+  .then(() => console.log("✅ MongoDB Connected"))
   .catch((err) => {
-    console.error("❌ MongoDB error:", err);
+    console.error("❌ MongoDB Connection Error:", err);
     process.exit(1);
   });
 
 // ---------------------------------------------------------
-// HELPERS
+// Utility: Chunk tokens
 // ---------------------------------------------------------
 function chunkArray(arr, size) {
   const out = [];
@@ -88,30 +99,24 @@ function chunkArray(arr, size) {
 }
 
 // ---------------------------------------------------------
-// SEND PUSH TO TOKENS  (Admin SDK v12+)
+// PUSH NOTIFICATIONS
 // ---------------------------------------------------------
 async function sendPushToTokens(data, tokens) {
-  if (!tokens || !tokens.length) return;
+  if (!tokens.length) return;
 
   const ICON = "https://app.catination.com/catination-app-logo.png";
 
   const title = `🔥 New Lead — ${data.source || "Lead"}`;
-  const body = `${data.name || ""} — ${data.phone || ""} — ${data.propertyName || ""}`;
+  const body = `${data.name || ""} ${data.phone || ""} ${data.propertyName || ""}`;
   const leadId = String(data.leadId || "");
 
   const link =
     data.webLink ||
     `https://app.catination.com/dashboard/lead-management?leadId=${leadId}`;
 
-  // --------------- FINAL FIXED MESSAGE ---------------
-  const baseMsg = {
-    // Top-level notification ensures mobile platforms show system notifications
-    notification: {
-      title,
-      body,
-    },
+  const msgBase = {
+    notification: { title, body },
 
-    // Data for your service worker / deep linking
     data: {
       leadId,
       name: String(data.name || ""),
@@ -119,39 +124,27 @@ async function sendPushToTokens(data, tokens) {
       property: String(data.propertyName || ""),
     },
 
-    // Android-specific options (heads-up, channel, sound)
     android: {
       priority: "high",
       notification: {
         title,
         body,
-        channelId: "catination_leads",
-        sound: "default",
         icon: ICON,
-        // click_action is sometimes used by some clients; keep generic click action
-        clickAction: "FLUTTER_NOTIFICATION_CLICK",
-        notificationCount: 1,
+        sound: "default",
+        channelId: "catination_leads",
       },
     },
 
-    // iOS / APNs options
     apns: {
-      headers: {
-        "apns-priority": "10",
-      },
+      headers: { "apns-priority": "10" },
       payload: {
         aps: {
-          alert: {
-            title,
-            body,
-          },
+          alert: { title, body },
           sound: "default",
-          // content-available:1 can be used for silent notifications if needed
         },
       },
     },
 
-    // Web push (PWA / Chrome) — your service worker will handle click and extras
     webpush: {
       headers: { Urgency: "high" },
       notification: {
@@ -160,108 +153,83 @@ async function sendPushToTokens(data, tokens) {
         icon: ICON,
         badge: ICON,
         vibrate: [200, 100, 200],
-        requireInteraction: true,
         renotify: true,
+        requireInteraction: true,
         tag: "catination_notification",
       },
-      fcmOptions: {
-        link,
-      },
+      fcmOptions: { link },
     },
   };
-  // ---------------------------------------------------
 
   const batches = chunkArray(tokens, 500);
 
   for (const batch of batches) {
-    const msg = { ...baseMsg, tokens: batch };
-
     try {
-      // Admin SDK v12+: sendEachForMulticast accepts tokens + platform options
-      const res = await admin.messaging().sendEachForMulticast(msg);
+      const res = await admin.messaging().sendEachForMulticast({
+        ...msgBase,
+        tokens: batch,
+      });
 
       console.log(
         `📨 Push sent → success:${res.successCount} failed:${res.failureCount}`
       );
 
-      // detailed logging and cleanup for failed tokens
+      // Cleanup invalid tokens
       res.responses.forEach((r, i) => {
         if (!r.success) {
           const err = r.error || {};
-          const failedToken = batch[i];
+          const bad = batch[i];
 
-          console.error("❌ FCM ERROR FOR TOKEN:", failedToken);
-          console.error("   → code:", err.code || "N/A");
-          console.error("   → message:", err.message || "N/A");
-          if (err.details) console.error("   → details:", err.details);
-          if (err.info) console.error("   → info:", err.info);
+          console.log("❌ Invalid Token:", bad, err.code);
 
           if (
-            err.code === "messaging/registration-token-not-registered" ||
-            err.code === "messaging/invalid-registration-token"
+            err.code === "messaging/invalid-registration-token" ||
+            err.code === "messaging/registration-token-not-registered"
           ) {
-            Token.deleteOne({ token: failedToken })
-              .then(() => console.log("❌ Removed invalid token:", failedToken))
-              .catch((err) => console.error("Token removal error:", err));
+            Token.deleteOne({ token: bad })
+              .then(() => console.log("🗑 Token deleted:", bad))
+              .catch((e) => console.log("❌ Delete error:", e));
           }
         }
       });
     } catch (err) {
-      // If admin.messaging throws, log entire error for debugging
-      console.error("🔥 FCM sendEachForMulticast ERROR:", err);
+      console.error("🔥 FCM Send Error:", err.message);
     }
   }
 }
 
 // ---------------------------------------------------------
-// HANDLE LEAD EVENT
+// LEAD EVENT HANDLER
 // ---------------------------------------------------------
 async function handleLeadEvent(data) {
-  try {
-    console.log("🚀 Lead event received:", data);
+  console.log("\n🚀 LEAD EVENT RECEIVED:", data);
 
-    // map tenantId → companyId
-    if (!data.companyId && data.tenantId) {
-      data.companyId = data.tenantId;
-      console.log("🔄 tenantId → companyId mapped:", data.companyId);
-    }
-
-    if (!data.companyId) {
-      console.log("⚠ Lead missing companyId — ignored");
-      return;
-    }
-
-    const allTokens = await Token.find({
-      companyId: String(data.companyId),
-      enabled: true,
-    }).lean();
-
-    if (!allTokens.length) {
-      console.log("⚠ No tokens found for company:", data.companyId);
-      return;
-    }
-
-    const targets = [];
-
-    for (const t of allTokens) {
-      if (t.role === "EMPLOYEE" && String(t.roleExperience) === "1") {
-        targets.push(t.token);
-      }
-      if (t.role === "ADMIN") {
-        targets.push(t.token);
-      }
-    }
-
-    if (!targets.length) {
-      console.log("⚠ No eligible notification receivers");
-      return;
-    }
-
-    console.log(`📌 Final targets: ${targets.length}`);
-    await sendPushToTokens(data, targets);
-  } catch (err) {
-    console.error("❌ handleLeadEvent ERROR:", err);
+  if (!data.companyId && data.tenantId) {
+    data.companyId = data.tenantId;
   }
+
+  if (!data.companyId) {
+    console.log("⚠ No companyId — skipping push");
+    return;
+  }
+
+  const allTokens = await Token.find({
+    companyId: String(data.companyId),
+    enabled: true,
+  }).lean();
+
+  const targets = [];
+  allTokens.forEach((t) => {
+    if (t.role === "ADMIN") targets.push(t.token);
+    if (t.role === "EMPLOYEE" && String(t.roleExperience) === "1")
+      targets.push(t.token);
+  });
+
+  console.log("🎯 TARGET TOKENS:", targets.length);
+
+  if (targets.length === 0) return;
+
+  await sendPushToTokens(data, targets);
 }
 
 // ---------------------------------------------------------
@@ -272,22 +240,22 @@ let reconnectDelay = 2000;
 const MAX_DELAY = 60000;
 
 async function startSSE() {
-  if (!SSE_URL) return;
+  if (!SSE_URL) {
+    console.log("⚠ SSE_URL missing → skipping SSE");
+    return;
+  }
   if (sseRunning) return;
 
-  console.log("🔌 Connecting to SSE:", SSE_URL);
   sseRunning = true;
+  console.log("🔌 Connecting SSE:", SSE_URL);
 
   try {
     const res = await fetch(SSE_URL);
 
-    if (!res.ok) {
-      console.error("❌ SSE failed:", res.status);
-      sseRunning = false;
-      return setTimeout(startSSE, reconnectDelay);
-    }
+    if (!res.ok) throw new Error("SSE error: " + res.status);
 
-    console.log("🟢 SSE connected");
+    console.log("🟢 SSE Connected");
+
     reconnectDelay = 2000;
 
     const reader = res.body.getReader();
@@ -295,144 +263,108 @@ async function startSSE() {
     let buffer = "";
 
     while (true) {
-      const { done, value } = await reader.read();
+      const { value, done } = await reader.read();
       if (done) break;
 
       buffer += decoder.decode(value, { stream: true });
 
       while (buffer.includes("\n\n")) {
         const idx = buffer.indexOf("\n\n");
-        const raw = buffer.slice(0, idx).trim();
+        const eventChunk = buffer.slice(0, idx).trim();
         buffer = buffer.slice(idx + 2);
 
-        if (!raw) continue;
+        if (!eventChunk) continue;
 
-        // find the first data: line (handle multi-line SSE safely)
-        const dataLines = raw
+        const line = eventChunk
           .split("\n")
-          .map((l) => l.trim())
-          .filter((l) => l.startsWith("data:"));
+          .find((l) => l.startsWith("data:"))
+          ?.replace("data:", "")
+          .trim();
 
-        if (!dataLines.length) {
-          console.log("ℹ Ignored non-data SSE chunk:", raw);
-          continue;
-        }
-
-        // Join multiple data lines into one JSON string (SSE allows splitting)
-        let dataLine = dataLines.map((l) => l.replace(/^data:\s?/, "")).join("");
-
-        if (!dataLine.startsWith("{")) {
-          console.log("ℹ Ignored non-JSON SSE:", dataLine);
-          continue;
-        }
+        if (!line || !line.startsWith("{")) continue;
 
         try {
-          const parsed = JSON.parse(dataLine);
-          await handleLeadEvent(parsed);
+          const json = JSON.parse(line);
+          await handleLeadEvent(json);
         } catch (err) {
-          console.error("❌ SSE parse error:", err, dataLine);
+          console.error("❌ SSE JSON Parse Error:", err);
         }
       }
     }
   } catch (err) {
-    console.error("❌ SSE connection error:", err);
+    console.error("❌ SSE Connection Error:", err.message);
   }
 
-  console.log("⚠ SSE closed — reconnecting…");
+  console.log("⚠ SSE Closed — reconnecting soon...");
   sseRunning = false;
 
-  reconnectDelay = Math.min(reconnectDelay * 1.5, MAX_DELAY);
+  reconnectDelay = Math.min(reconnectDelay * 1.4, MAX_DELAY);
   setTimeout(startSSE, reconnectDelay);
 }
 
+// Start SSE on boot
 startSSE();
 
 // ---------------------------------------------------------
-// EXPRESS ROUTES
-// ---------------------------------------------------------
-// REGISTER TOKEN
+// REGISTER TOKEN (Matches frontend firebase.js)
 // ---------------------------------------------------------
 app.post("/register-token", async (req, res) => {
-  try {
-    console.log("📩 Incoming /register-token:", req.body);
+  console.log("\n🔥 /register-token HIT");
+  console.log("REQ BODY:", req.body);
 
+  try {
     const { token, userId, companyId, role, roleExperience, clientInfo } =
-      req.body || {};
+      req.body;
 
-    if (!token) return res.status(400).json({ error: "token required" });
-    if (!userId) return res.status(400).json({ error: "userId required" });
-    if (!companyId) return res.status(400).json({ error: "companyId required" });
-
-    await Token.updateOne(
-      { token },
-      {
-        token,
-        userId,
-        companyId,
-        role: role || "",
-        roleExperience: roleExperience || "0",
-        enabled: true,
-        clientInfo: clientInfo || null,
-        lastSeen: new Date(),
-      },
-      { upsert: true }
-    );
-
-    console.log("✅ Token saved for:", userId);
-    return res.json({ success: true });
-  } catch (err) {
-    console.error("register-token ERROR:", err);
-    return res.status(500).json({ error: "internal_error", details: err.message });
-  }
-});
-
-// LOGOUT TOKEN
-app.post("/logout-token", async (req, res) => {
-  try {
-    const { token, userId } = req.body || {};
-
-    if (token) {
-      await Token.updateOne({ token }, { enabled: false });
-    } else if (userId) {
-      await Token.updateMany({ userId }, { enabled: false });
+    if (!token || !userId || !companyId) {
+      console.log("❌ MISSING FIELDS:", { token, userId, companyId });
+      return res.status(400).json({ error: "Missing fields" });
     }
 
-    res.json({ success: true });
+    const payload = {
+      token,
+      userId,
+      companyId,
+      role: role || "",
+      roleExperience: roleExperience || "0",
+      enabled: true,
+      clientInfo: clientInfo || {},
+      lastSeen: new Date(),
+    };
+
+    console.log("📝 UPSERT:", payload);
+
+    await Token.updateOne({ token }, payload, { upsert: true });
+
+    console.log("✅ TOKEN STORED SUCCESSFULLY");
+
+    return res.json({ success: true });
   } catch (err) {
-    console.error("logout-token ERROR:", err);
-    res.status(500).json({ error: "internal_error" });
+    console.error("🔥 REGISTER ERROR:", err);
+    return res.status(500).json({ error: err.message });
   }
 });
 
-// REMOVE TOKEN
-app.post("/remove-token", async (req, res) => {
-  try {
-    const { token } = req.body || {};
-    if (!token) return res.status(400).json({ error: "token required" });
+// ---------------------------------------------------------
+// LOGOUT TOKEN
+// ---------------------------------------------------------
+app.post("/logout-token", async (req, res) => {
+  const { userId, token } = req.body;
 
-    const r = await Token.deleteOne({ token });
-    res.json({ success: true, removed: r.deletedCount });
-  } catch (err) {
-    console.error("remove-token ERROR:", err);
-    res.status(500).json({ error: "internal_error" });
-  }
+  if (token) await Token.updateOne({ token }, { enabled: false });
+  if (userId) await Token.updateMany({ userId }, { enabled: false });
+
+  res.json({ success: true });
 });
 
-app.get("/tokens", async (req, res) => {
-  try {
-    const list = await Token.find({}).sort({ lastSeen: -1 }).limit(200);
-    res.json({ total: list.length, tokens: list });
-  } catch (err) {
-    console.error("tokens ERROR:", err);
-    res.status(500).json({ error: "internal_error" });
-  }
-});
-
+// ---------------------------------------------------------
+// HEALTH CHECK
+// ---------------------------------------------------------
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 // ---------------------------------------------------------
 // START SERVER
 // ---------------------------------------------------------
-app.listen(PORT, () => {
-  console.log(`🚀 Push Server running on port ${PORT}`);
-});
+app.listen(PORT, () =>
+  console.log(`🚀 Catination Push Server running on PORT ${PORT}`)
+);
