@@ -1,11 +1,15 @@
 /**
- * Catination Push Server — FINAL 2025 VERSION
- * Supports:
- *  • FCM Token Registration (LOCAL + PROD)
- *  • SSE Lead Listener
- *  • Push Notifications
- *  • Admin + Employee Logic
- *  • Full Console Logs
+ * Catination Push Server — FINAL 2025 VERSION (PATCHED)
+ * - Original behavior preserved
+ * - Added deduplication for:
+ *    • duplicate DB tokens
+ *    • duplicate SSE events for same leadId (short TTL)
+ * - Defensive token normalization before sending to FCM
+ * - Logging improved
+ *
+ * NOTE:
+ * - This file is the corrected FULL server.js requested (option A)
+ * - No inventory routes included (per your choice)
  */
 
 require("dotenv").config();
@@ -99,15 +103,49 @@ function chunkArray(arr, size) {
 }
 
 // ---------------------------------------------------------
-// PUSH NOTIFICATIONS
+ // DEDUPLICATION HELPERS (new)
+//  - recentLeads: short TTL cache for leadId -> prevents processing same lead repeatedly
+ //  - normalizes tokens to unique list before sending to FCM
+// ---------------------------------------------------------
+const recentLeads = new Map(); // leadId -> timestamp(ms)
+const RECENT_LEAD_TTL = 20 * 1000; // 20 seconds (tune if needed)
+
+function markLeadProcessed(leadId) {
+  if (!leadId) return;
+  recentLeads.set(String(leadId), Date.now());
+}
+
+function isLeadRecentlyProcessed(leadId) {
+  if (!leadId) return false;
+  const ts = recentLeads.get(String(leadId));
+  if (!ts) return false;
+  if (Date.now() - ts < RECENT_LEAD_TTL) return true;
+  recentLeads.delete(String(leadId));
+  return false;
+}
+
+// periodic cleanup to avoid memory growth
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of recentLeads) {
+    if (now - v > RECENT_LEAD_TTL) recentLeads.delete(k);
+  }
+}, 30000);
+
+// ---------------------------------------------------------
+// PUSH NOTIFICATIONS (patched)
+//  - removes falsy tokens, dedupes tokens
+//  - keeps original payload structure
 // ---------------------------------------------------------
 async function sendPushToTokens(data, tokens) {
-  if (!tokens.length) return;
+  // Defensive normalization: remove falsy tokens and dedupe
+  const normalized = Array.from(new Set((tokens || []).filter(Boolean)));
+  if (!normalized.length) return;
 
   const ICON = "https://app.catination.com/catination-app-logo.png";
 
   const title = `🔥 New Lead — ${data.source || "Lead"}`;
-  const body = `${data.name || ""} ${data.phone || ""} ${data.propertyName || ""}`;
+  const body = `${data.name || ""} ${data.phone || ""} ${data.propertyName || ""}`.trim();
   const leadId = String(data.leadId || "");
 
   const link =
@@ -130,7 +168,7 @@ async function sendPushToTokens(data, tokens) {
         title,
         body,
         icon: ICON,
-        sound: "default",
+        sound: "default", // Android respects channel sound too; client must create channel properly
         channelId: "catination_leads",
       },
     },
@@ -161,7 +199,7 @@ async function sendPushToTokens(data, tokens) {
     },
   };
 
-  const batches = chunkArray(tokens, 500);
+  const batches = chunkArray(normalized, 500);
 
   for (const batch of batches) {
     try {
@@ -193,43 +231,68 @@ async function sendPushToTokens(data, tokens) {
         }
       });
     } catch (err) {
-      console.error("🔥 FCM Send Error:", err.message);
+      console.error("🔥 FCM Send Error:", err && err.message ? err.message : err);
     }
   }
 }
 
 // ---------------------------------------------------------
-// LEAD EVENT HANDLER
+// LEAD EVENT HANDLER (patched)
+//  - dedupe by leadId (recentLeads)
+//  - dedupe tokens from DB
 // ---------------------------------------------------------
 async function handleLeadEvent(data) {
-  console.log("\n🚀 LEAD EVENT RECEIVED:", data);
+  try {
+    console.log("\n🚀 LEAD EVENT RECEIVED:", data);
 
-  if (!data.companyId && data.tenantId) {
-    data.companyId = data.tenantId;
+    if (!data.companyId && data.tenantId) {
+      data.companyId = data.tenantId;
+    }
+
+    if (!data.companyId) {
+      console.log("⚠ No companyId — skipping push");
+      return;
+    }
+
+    const leadId = data.leadId ? String(data.leadId) : null;
+    if (leadId && isLeadRecentlyProcessed(leadId)) {
+      console.log(`⏭ Duplicate lead event ignored (recent): ${leadId}`);
+      return;
+    }
+
+    // Fetch tokens for the company
+    const allTokens = await Token.find({
+      companyId: String(data.companyId),
+      enabled: true,
+    }).lean();
+
+    // Build unique token set (dedupe identical tokens)
+    const tokenSet = new Set();
+
+    allTokens.forEach((t) => {
+      if (!t || !t.token) return;
+      // keep same logic for target selection
+      if (t.role === "ADMIN") tokenSet.add(String(t.token));
+      if (t.role === "EMPLOYEE" && String(t.roleExperience) === "1")
+        tokenSet.add(String(t.token));
+    });
+
+    const targets = Array.from(tokenSet).filter(Boolean);
+
+    console.log("🎯 TARGET TOKENS (deduped):", targets.length);
+
+    if (targets.length === 0) {
+      if (leadId) markLeadProcessed(leadId);
+      return;
+    }
+
+    await sendPushToTokens(data, targets);
+
+    // Mark processed to avoid immediate duplicate handling
+    if (leadId) markLeadProcessed(leadId);
+  } catch (err) {
+    console.error("handleLeadEvent ERROR:", err);
   }
-
-  if (!data.companyId) {
-    console.log("⚠ No companyId — skipping push");
-    return;
-  }
-
-  const allTokens = await Token.find({
-    companyId: String(data.companyId),
-    enabled: true,
-  }).lean();
-
-  const targets = [];
-  allTokens.forEach((t) => {
-    if (t.role === "ADMIN") targets.push(t.token);
-    if (t.role === "EMPLOYEE" && String(t.roleExperience) === "1")
-      targets.push(t.token);
-  });
-
-  console.log("🎯 TARGET TOKENS:", targets.length);
-
-  if (targets.length === 0) return;
-
-  await sendPushToTokens(data, targets);
 }
 
 // ---------------------------------------------------------
@@ -334,6 +397,7 @@ app.post("/register-token", async (req, res) => {
 
     console.log("📝 UPSERT:", payload);
 
+    // Upsert token: keep single row per token
     await Token.updateOne({ token }, payload, { upsert: true });
 
     console.log("✅ TOKEN STORED SUCCESSFULLY");
