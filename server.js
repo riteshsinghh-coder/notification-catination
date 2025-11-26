@@ -91,7 +91,7 @@ function chunkArray(arr, size) {
 // SEND PUSH TO TOKENS  (Admin SDK v12+)
 // ---------------------------------------------------------
 async function sendPushToTokens(data, tokens) {
-  if (!tokens.length) return;
+  if (!tokens || !tokens.length) return;
 
   const ICON = "https://app.catination.com/catination-app-logo.png";
 
@@ -103,14 +103,55 @@ async function sendPushToTokens(data, tokens) {
     data.webLink ||
     `https://app.catination.com/dashboard/lead-management?leadId=${leadId}`;
 
+  // --------------- FINAL FIXED MESSAGE ---------------
   const baseMsg = {
-    notification: { title, body },
+    // Top-level notification ensures mobile platforms show system notifications
+    notification: {
+      title,
+      body,
+    },
+
+    // Data for your service worker / deep linking
     data: {
       leadId,
       name: String(data.name || ""),
       phone: String(data.phone || ""),
       property: String(data.propertyName || ""),
     },
+
+    // Android-specific options (heads-up, channel, sound)
+    android: {
+      priority: "high",
+      notification: {
+        title,
+        body,
+        channelId: "catination_leads",
+        sound: "default",
+        icon: ICON,
+        // click_action is sometimes used by some clients; keep generic click action
+        clickAction: "FLUTTER_NOTIFICATION_CLICK",
+        notificationCount: 1,
+      },
+    },
+
+    // iOS / APNs options
+    apns: {
+      headers: {
+        "apns-priority": "10",
+      },
+      payload: {
+        aps: {
+          alert: {
+            title,
+            body,
+          },
+          sound: "default",
+          // content-available:1 can be used for silent notifications if needed
+        },
+      },
+    },
+
+    // Web push (PWA / Chrome) — your service worker will handle click and extras
     webpush: {
       headers: { Urgency: "high" },
       notification: {
@@ -118,14 +159,17 @@ async function sendPushToTokens(data, tokens) {
         body,
         icon: ICON,
         badge: ICON,
+        vibrate: [200, 100, 200],
         requireInteraction: true,
         renotify: true,
-        vibrate: [200, 100, 200],
-        tag: "catination_high_priority",
+        tag: "catination_notification",
       },
-      fcmOptions: { link },
+      fcmOptions: {
+        link,
+      },
     },
   };
+  // ---------------------------------------------------
 
   const batches = chunkArray(tokens, 500);
 
@@ -133,7 +177,7 @@ async function sendPushToTokens(data, tokens) {
     const msg = { ...baseMsg, tokens: batch };
 
     try {
-      // Admin SDK v12+: sendEachForMulticast
+      // Admin SDK v12+: sendEachForMulticast accepts tokens + platform options
       const res = await admin.messaging().sendEachForMulticast(msg);
 
       console.log(
@@ -163,6 +207,7 @@ async function sendPushToTokens(data, tokens) {
         }
       });
     } catch (err) {
+      // If admin.messaging throws, log entire error for debugging
       console.error("🔥 FCM sendEachForMulticast ERROR:", err);
     }
   }
