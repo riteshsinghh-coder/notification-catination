@@ -1,4 +1,4 @@
-/**
+/** 
  * Catination Push Server — FINAL 2025 VERSION (PATCHED)
  * - Original behavior preserved
  * - Added deduplication for:
@@ -104,11 +104,8 @@ function chunkArray(arr, size) {
 
 // ---------------------------------------------------------
  // DEDUPLICATION HELPERS (new)
-//  - recentLeads: short TTL cache for leadId -> prevents processing same lead repeatedly
- //  - normalizes tokens to unique list before sending to FCM
-// ---------------------------------------------------------
-const recentLeads = new Map(); // leadId -> timestamp(ms)
-const RECENT_LEAD_TTL = 20 * 1000; // 20 seconds (tune if needed)
+const recentLeads = new Map(); 
+const RECENT_LEAD_TTL = 20 * 1000;
 
 function markLeadProcessed(leadId) {
   if (!leadId) return;
@@ -120,11 +117,10 @@ function isLeadRecentlyProcessed(leadId) {
   const ts = recentLeads.get(String(leadId));
   if (!ts) return false;
   if (Date.now() - ts < RECENT_LEAD_TTL) return true;
-  recentLeads.delete(String(leadId));
+  recentLeads.delete(leadId);
   return false;
 }
 
-// periodic cleanup to avoid memory growth
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of recentLeads) {
@@ -133,12 +129,9 @@ setInterval(() => {
 }, 30000);
 
 // ---------------------------------------------------------
-// PUSH NOTIFICATIONS (patched)
-//  - removes falsy tokens, dedupes tokens
-//  - keeps original payload structure
+// PUSH NOTIFICATIONS (PATCHED + ACCEPT BUTTON POST METHOD)
 // ---------------------------------------------------------
 async function sendPushToTokens(data, tokens) {
-  // Defensive normalization: remove falsy tokens and dedupe
   const normalized = Array.from(new Set((tokens || []).filter(Boolean)));
   if (!normalized.length) return;
 
@@ -148,9 +141,7 @@ async function sendPushToTokens(data, tokens) {
   const body = `${data.name || ""} ${data.phone || ""} ${data.propertyName || ""}`.trim();
   const leadId = String(data.leadId || "");
 
-  const link =
-    data.webLink ||
-    `https://app.catination.com/dashboard/lead-management?leadId=${leadId}`;
+  const acceptUrl = `https://api.catination.com/api/employee/assignLead/${leadId}`;
 
   const msgBase = {
     notification: { title, body },
@@ -160,6 +151,7 @@ async function sendPushToTokens(data, tokens) {
       name: String(data.name || ""),
       phone: String(data.phone || ""),
       property: String(data.propertyName || ""),
+      acceptUrl,  // ⭐ added
     },
 
     android: {
@@ -168,8 +160,14 @@ async function sendPushToTokens(data, tokens) {
         title,
         body,
         icon: ICON,
-        sound: "default", // Android respects channel sound too; client must create channel properly
+        sound: "default",
         channelId: "catination_leads",
+        actions: [
+          {
+            action: "accept",
+            title: "Accept",
+          },
+        ],
       },
     },
 
@@ -179,6 +177,7 @@ async function sendPushToTokens(data, tokens) {
         aps: {
           alert: { title, body },
           sound: "default",
+          category: "ACCEPT_CATEGORY",
         },
       },
     },
@@ -193,9 +192,17 @@ async function sendPushToTokens(data, tokens) {
         vibrate: [200, 100, 200],
         renotify: true,
         requireInteraction: true,
+        actions: [
+          {
+            action: "accept",
+            title: "Accept",
+          },
+        ],
         tag: "catination_notification",
       },
-      fcmOptions: { link },
+      fcmOptions: {
+        link: acceptUrl,
+      },
     },
   };
 
@@ -212,7 +219,6 @@ async function sendPushToTokens(data, tokens) {
         `📨 Push sent → success:${res.successCount} failed:${res.failureCount}`
       );
 
-      // Cleanup invalid tokens
       res.responses.forEach((r, i) => {
         if (!r.success) {
           const err = r.error || {};
@@ -231,15 +237,13 @@ async function sendPushToTokens(data, tokens) {
         }
       });
     } catch (err) {
-      console.error("🔥 FCM Send Error:", err && err.message ? err.message : err);
+      console.error("🔥 FCM Send Error:", err?.message || err);
     }
   }
 }
 
 // ---------------------------------------------------------
 // LEAD EVENT HANDLER (patched)
-//  - dedupe by leadId (recentLeads)
-//  - dedupe tokens from DB
 // ---------------------------------------------------------
 async function handleLeadEvent(data) {
   try {
@@ -256,30 +260,25 @@ async function handleLeadEvent(data) {
 
     const leadId = data.leadId ? String(data.leadId) : null;
     if (leadId && isLeadRecentlyProcessed(leadId)) {
-      console.log(`⏭ Duplicate lead event ignored (recent): ${leadId}`);
+      console.log(`⏭ Duplicate lead ignored (recent): ${leadId}`);
       return;
     }
 
-    // Fetch tokens for the company
     const allTokens = await Token.find({
       companyId: String(data.companyId),
       enabled: true,
     }).lean();
 
-    // Build unique token set (dedupe identical tokens)
     const tokenSet = new Set();
-
     allTokens.forEach((t) => {
       if (!t || !t.token) return;
-      // keep same logic for target selection
-      if (t.role === "ADMIN") tokenSet.add(String(t.token));
+      if (t.role === "ADMIN") tokenSet.add(t.token);
       if (t.role === "EMPLOYEE" && String(t.roleExperience) === "1")
-        tokenSet.add(String(t.token));
+        tokenSet.add(t.token);
     });
 
     const targets = Array.from(tokenSet).filter(Boolean);
-
-    console.log("🎯 TARGET TOKENS (deduped):", targets.length);
+    console.log("🎯 TARGET TOKENS:", targets.length);
 
     if (targets.length === 0) {
       if (leadId) markLeadProcessed(leadId);
@@ -288,7 +287,6 @@ async function handleLeadEvent(data) {
 
     await sendPushToTokens(data, targets);
 
-    // Mark processed to avoid immediate duplicate handling
     if (leadId) markLeadProcessed(leadId);
   } catch (err) {
     console.error("handleLeadEvent ERROR:", err);
@@ -358,18 +356,18 @@ async function startSSE() {
     console.error("❌ SSE Connection Error:", err.message);
   }
 
-  console.log("⚠ SSE Closed — reconnecting soon...");
+  console.log("⚠ SSE Closed — reconnecting...");
   sseRunning = false;
 
   reconnectDelay = Math.min(reconnectDelay * 1.4, MAX_DELAY);
   setTimeout(startSSE, reconnectDelay);
 }
 
-// Start SSE on boot
+// Start SSE
 startSSE();
 
 // ---------------------------------------------------------
-// REGISTER TOKEN (Matches frontend firebase.js)
+// REGISTER TOKEN
 // ---------------------------------------------------------
 app.post("/register-token", async (req, res) => {
   console.log("\n🔥 /register-token HIT");
@@ -397,7 +395,6 @@ app.post("/register-token", async (req, res) => {
 
     console.log("📝 UPSERT:", payload);
 
-    // Upsert token: keep single row per token
     await Token.updateOne({ token }, payload, { upsert: true });
 
     console.log("✅ TOKEN STORED SUCCESSFULLY");
