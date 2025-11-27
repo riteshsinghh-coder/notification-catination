@@ -1,15 +1,14 @@
 /**
- * Catination Push Server — FINAL 2025 VERSION (PATCHED)
- * - Original behavior preserved
- * - Added deduplication for:
- *    • duplicate DB tokens
- *    • duplicate SSE events for same leadId (short TTL)
+ * Catination Push Server — FINAL 2025 VERSION (STRICT SINGLE-DEVICE MODE)
+ * - Preserves original behavior
+ * - Enforces "1 user = 1 active token" (strict single-device mode)
+ * - Deletes other tokens for the same user when a new token is registered
+ * - Keeps dedupe for duplicate DB tokens and SSE event dedupe
  * - Defensive token normalization before sending to FCM
- * - Logging improved
+ * - Improved logging around token lifecycle
  *
- * NOTE:
- * - This file is the corrected FULL server.js requested (option A)
- * - No inventory routes included (per your choice)
+ * NOTE: Ensure your Token model has fields at least:
+ *   token, userId, companyId, role, roleExperience, enabled, clientInfo, lastSeen
  */
 
 require("dotenv").config();
@@ -373,7 +372,8 @@ startSSE();
 // REGISTER TOKEN (Matches frontend firebase.js)
 // ---------------------------------------------------------
 // ---------------------------------------------------------
-// 🚀 SUPER-OPTIMIZED REGISTER TOKEN (FAST RESPONSE + ASYNC WRITE)
+// Strict single-device behavior: when a new token is registered by a user,
+// delete all other tokens for that user (token != newToken) so user has exactly one active token.
 // ---------------------------------------------------------
 app.post("/register-token", async (req, res) => {
   console.log("\n🔥 /register-token HIT");
@@ -388,13 +388,13 @@ app.post("/register-token", async (req, res) => {
       return res.status(400).json({ error: "Missing fields" });
     }
 
-    // ⭐ Respond IMMEDIATELY (NON-BLOCKING)
-    // This fixes all login delay & Render queue spikes
+    // Respond immediately to keep frontend fast
     res.json({ success: true });
 
-    // 🧵 Background processing (NON-BLOCKING)
+    // Background processing (NON-BLOCKING)
     setImmediate(async () => {
       try {
+        // Build payload
         const payload = {
           token,
           userId,
@@ -406,16 +406,41 @@ app.post("/register-token", async (req, res) => {
           lastSeen: new Date(),
         };
 
-        console.log("📝 (BG) Upserting Token:", payload);
+        console.log("📝 (BG) Upserting Token (strict single-device):", {
+          userId,
+          companyId,
+          tokenPreview: String(token).slice(0, 12) + "...",
+        });
 
-        await Token.updateOne({ token }, payload, { upsert: true });
+        // 1) Remove any OTHER tokens for this same user (strict single-device mode)
+        //    This will prevent multiple active tokens per user and thus duplicate notifications.
+        try {
+          const delRes = await Token.deleteMany({
+            userId,
+            token: { $ne: token },
+          });
+          if (delRes && delRes.deletedCount) {
+            console.log(
+              `🗑 Removed ${delRes.deletedCount} old token(s) for user ${userId}`
+            );
+          }
+        } catch (delErr) {
+          console.warn("⚠ Could not delete old tokens for user:", delErr);
+        }
 
-        console.log("✔ (BG) Token stored successfully");
+        // 2) Upsert the current token record (create or update)
+        // Use $set to avoid accidental overwrites
+        await Token.updateOne(
+          { token },
+          { $set: payload },
+          { upsert: true }
+        );
+
+        console.log("✔ (BG) Token stored successfully (strict mode)");
       } catch (bgErr) {
         console.error("🔥 (BG) Error storing token:", bgErr);
       }
     });
-
   } catch (err) {
     console.error("🔥 REGISTER ERROR (OUTER):", err);
     if (!res.headersSent) {
@@ -424,15 +449,18 @@ app.post("/register-token", async (req, res) => {
   }
 });
 
-
 // ---------------------------------------------------------
 // LOGOUT TOKEN
 // ---------------------------------------------------------
 app.post("/logout-token", async (req, res) => {
   const { userId, token } = req.body;
 
-  if (token) await Token.updateOne({ token }, { enabled: false });
-  if (userId) await Token.updateMany({ userId }, { enabled: false });
+  try {
+    if (token) await Token.updateOne({ token }, { enabled: false });
+    if (userId) await Token.updateMany({ userId }, { enabled: false });
+  } catch (err) {
+    console.error("🔥 LOGOUT TOKEN ERROR:", err);
+  }
 
   res.json({ success: true });
 });
