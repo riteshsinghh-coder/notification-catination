@@ -1,14 +1,6 @@
 /**
+ * server.js
  * Catination Push Server — FINAL 2025 VERSION (STRICT SINGLE-DEVICE MODE)
- * - Preserves original behavior
- * - Enforces "1 user = 1 active token" (strict single-device mode)
- * - Deletes other tokens for the same user when a new token is registered
- * - Keeps dedupe for duplicate DB tokens and SSE event dedupe
- * - Defensive token normalization before sending to FCM
- * - Improved logging around token lifecycle
- *
- * NOTE: Ensure your Token model has fields at least:
- *   token, userId, companyId, role, roleExperience, enabled, clientInfo, lastSeen
  */
 
 require("dotenv").config();
@@ -18,7 +10,7 @@ const mongoose = require("mongoose");
 const admin = require("firebase-admin");
 const Token = require("./models/Token");
 
-// Node 18+ fetch fix
+// Node fetch polyfill (for older Node versions)
 if (typeof fetch === "undefined") {
   global.fetch = require("node-fetch");
 }
@@ -26,9 +18,7 @@ if (typeof fetch === "undefined") {
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-// ---------------------------------------------------------
-// CORS CONFIG (Supports Local + Production)
-// ---------------------------------------------------------
+// -------------------- CORS --------------------
 app.use(
   cors({
     origin: [
@@ -43,9 +33,7 @@ app.use(
   })
 );
 
-// ---------------------------------------------------------
-// ENV VALIDATION
-// ---------------------------------------------------------
+// -------------------- ENV --------------------
 const PORT = process.env.PORT || 3000;
 const MONGO_URI = process.env.MONGO_URI;
 const SSE_URL = process.env.SSE_URL;
@@ -60,11 +48,8 @@ if (!FIREBASE_JSON) {
   process.exit(1);
 }
 
-// ---------------------------------------------------------
-// FIREBASE ADMIN INITIALIZATION
-// ---------------------------------------------------------
+// -------------------- Firebase Admin init --------------------
 let serviceAccount = null;
-
 try {
   serviceAccount = JSON.parse(FIREBASE_JSON);
 } catch (err) {
@@ -77,11 +62,8 @@ admin.initializeApp({
 });
 console.log("✅ Firebase Admin Initialized");
 
-// ---------------------------------------------------------
-// MONGO CONNECTION
-// ---------------------------------------------------------
+// -------------------- MongoDB --------------------
 mongoose.set("strictQuery", false);
-
 mongoose
   .connect(MONGO_URI)
   .then(() => console.log("✅ MongoDB Connected"))
@@ -90,9 +72,7 @@ mongoose
     process.exit(1);
   });
 
-// ---------------------------------------------------------
-// Utility: Chunk tokens
-// ---------------------------------------------------------
+// -------------------- Helpers --------------------
 function chunkArray(arr, size) {
   const out = [];
   for (let i = 0; i < arr.length; i += size) {
@@ -101,19 +81,14 @@ function chunkArray(arr, size) {
   return out;
 }
 
-// ---------------------------------------------------------
-// DEDUPLICATION HELPERS (new)
-//  - recentLeads: short TTL cache for leadId -> prevents processing same lead repeatedly
-//  - normalizes tokens to unique list before sending to FCM
-// ---------------------------------------------------------
-const recentLeads = new Map(); // leadId -> timestamp(ms)
-const RECENT_LEAD_TTL = 20 * 1000; // 20 seconds (tune if needed)
+// dedupe recent leads to avoid repeated processing
+const recentLeads = new Map();
+const RECENT_LEAD_TTL = 20 * 1000; // 20s
 
 function markLeadProcessed(leadId) {
   if (!leadId) return;
   recentLeads.set(String(leadId), Date.now());
 }
-
 function isLeadRecentlyProcessed(leadId) {
   if (!leadId) return false;
   const ts = recentLeads.get(String(leadId));
@@ -122,8 +97,6 @@ function isLeadRecentlyProcessed(leadId) {
   recentLeads.delete(String(leadId));
   return false;
 }
-
-// periodic cleanup to avoid memory growth
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of recentLeads) {
@@ -131,36 +104,22 @@ setInterval(() => {
   }
 }, 30000);
 
-// ---------------------------------------------------------
-// PUSH NOTIFICATIONS (patched)
-//  - removes falsy tokens, dedupes tokens
-//  - sends ONLY leadId, leadName, source in data
-// ---------------------------------------------------------
+// -------------------- Push sending --------------------
 async function sendPushToTokens(data, tokens) {
-  // Defensive normalization: remove falsy tokens and dedupe
   const normalized = Array.from(new Set((tokens || []).filter(Boolean)));
   if (!normalized.length) return;
 
   const ICON = "https://app.catination.com/catination-app-logo.png";
-
-  // Build only the required fields
   const leadId = String(data.leadId || "");
-  const leadName = String(data.name || "");
+  const leadName = String(data.name || data.leadName || "");
   const source = String(data.source || "");
 
-  // Visible notification text per your request:
   const title = `🔥 New Lead — ${source || "Lead"}`;
   const body = leadName || "New Lead";
 
   const msgBase = {
     notification: { title, body },
-
-    // << ONLY THESE THREE FIELDS IN data >>
-    data: {
-      leadId,
-      leadName,
-      source,
-    },
+    data: { leadId, leadName, source },
 
     android: {
       priority: "high",
@@ -168,19 +127,14 @@ async function sendPushToTokens(data, tokens) {
         title,
         body,
         icon: ICON,
-        sound: "default", // Android respects channel sound too; client must create channel properly
+        sound: "default",
         channelId: "catination_leads",
       },
     },
 
     apns: {
       headers: { "apns-priority": "10" },
-      payload: {
-        aps: {
-          alert: { title, body },
-          sound: "default",
-        },
-      },
+      payload: { aps: { alert: { title, body }, sound: "default" } },
     },
 
     webpush: {
@@ -195,12 +149,10 @@ async function sendPushToTokens(data, tokens) {
         requireInteraction: true,
         tag: "catination_notification",
       },
-      // intentionally no fcmOptions.link included
     },
   };
 
   const batches = chunkArray(normalized, 500);
-
   for (const batch of batches) {
     try {
       const res = await admin.messaging().sendEachForMulticast({
@@ -208,25 +160,19 @@ async function sendPushToTokens(data, tokens) {
         tokens: batch,
       });
 
-      console.log(
-        `📨 Push sent → success:${res.successCount} failed:${res.failureCount}`
-      );
+      console.log(`📨 Push sent → success:${res.successCount} failed:${res.failureCount}`);
 
-      // Cleanup invalid tokens
+      // remove invalid tokens
       res.responses.forEach((r, i) => {
         if (!r.success) {
           const err = r.error || {};
           const bad = batch[i];
-
           console.log("❌ Invalid Token:", bad, err.code);
-
           if (
             err.code === "messaging/invalid-registration-token" ||
             err.code === "messaging/registration-token-not-registered"
           ) {
-            Token.deleteOne({ token: bad })
-              .then(() => console.log("🗑 Token deleted:", bad))
-              .catch((e) => console.log("❌ Delete error:", e));
+            Token.deleteOne({ token: bad }).catch((e) => console.log("❌ Delete error:", e));
           }
         }
       });
@@ -236,19 +182,12 @@ async function sendPushToTokens(data, tokens) {
   }
 }
 
-// ---------------------------------------------------------
-// LEAD EVENT HANDLER (patched)
-//  - dedupe by leadId (recentLeads)
-//  - dedupe tokens from DB
-// ---------------------------------------------------------
+// -------------------- Lead handler --------------------
 async function handleLeadEvent(data) {
   try {
     console.log("\n🚀 LEAD EVENT RECEIVED:", data);
 
-    if (!data.companyId && data.tenantId) {
-      data.companyId = data.tenantId;
-    }
-
+    if (!data.companyId && data.tenantId) data.companyId = data.tenantId;
     if (!data.companyId) {
       console.log("⚠ No companyId — skipping push");
       return;
@@ -260,44 +199,30 @@ async function handleLeadEvent(data) {
       return;
     }
 
-    // Fetch tokens for the company
-    const allTokens = await Token.find({
-      companyId: String(data.companyId),
-      enabled: true,
-    }).lean();
+    const allTokens = await Token.find({ companyId: String(data.companyId), enabled: true }).lean();
 
-    // Build unique token set (dedupe identical tokens)
     const tokenSet = new Set();
-
     allTokens.forEach((t) => {
       if (!t || !t.token) return;
-      // keep same logic for target selection
       if (t.role === "ADMIN") tokenSet.add(String(t.token));
-      if (t.role === "EMPLOYEE" && String(t.roleExperience) === "1")
-        tokenSet.add(String(t.token));
+      if (t.role === "EMPLOYEE" && String(t.roleExperience) === "1") tokenSet.add(String(t.token));
     });
 
     const targets = Array.from(tokenSet).filter(Boolean);
-
     console.log("🎯 TARGET TOKENS (deduped):", targets.length);
-
     if (targets.length === 0) {
       if (leadId) markLeadProcessed(leadId);
       return;
     }
 
     await sendPushToTokens(data, targets);
-
-    // Mark processed to avoid immediate duplicate handling
     if (leadId) markLeadProcessed(leadId);
   } catch (err) {
     console.error("handleLeadEvent ERROR:", err);
   }
 }
 
-// ---------------------------------------------------------
-// SSE LISTENER
-// ---------------------------------------------------------
+// -------------------- SSE listener --------------------
 let sseRunning = false;
 let reconnectDelay = 2000;
 const MAX_DELAY = 60000;
@@ -314,11 +239,9 @@ async function startSSE() {
 
   try {
     const res = await fetch(SSE_URL);
-
     if (!res.ok) throw new Error("SSE error: " + res.status);
 
     console.log("🟢 SSE Connected");
-
     reconnectDelay = 2000;
 
     const reader = res.body.getReader();
@@ -328,14 +251,12 @@ async function startSSE() {
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
-
       buffer += decoder.decode(value, { stream: true });
 
       while (buffer.includes("\n\n")) {
         const idx = buffer.indexOf("\n\n");
         const eventChunk = buffer.slice(0, idx).trim();
         buffer = buffer.slice(idx + 2);
-
         if (!eventChunk) continue;
 
         const line = eventChunk
@@ -348,6 +269,7 @@ async function startSSE() {
 
         try {
           const json = JSON.parse(line);
+          // handle lead event (non-blocking but awaited to keep order)
           await handleLeadEvent(json);
         } catch (err) {
           console.error("❌ SSE JSON Parse Error:", err);
@@ -355,46 +277,37 @@ async function startSSE() {
       }
     }
   } catch (err) {
-    console.error("❌ SSE Connection Error:", err.message);
+    console.error("❌ SSE Connection Error:", err && err.message ? err.message : err);
   }
 
   console.log("⚠ SSE Closed — reconnecting soon...");
   sseRunning = false;
-
   reconnectDelay = Math.min(reconnectDelay * 1.4, MAX_DELAY);
   setTimeout(startSSE, reconnectDelay);
 }
 
-// Start SSE on boot
+// start SSE if configured
 startSSE();
 
-// ---------------------------------------------------------
-// REGISTER TOKEN (Matches frontend firebase.js)
-// ---------------------------------------------------------
-// ---------------------------------------------------------
-// Strict single-device behavior: when a new token is registered by a user,
-// delete all other tokens for that user (token != newToken) so user has exactly one active token.
-// ---------------------------------------------------------
+// -------------------- API: register-token --------------------
 app.post("/register-token", async (req, res) => {
   console.log("\n🔥 /register-token HIT");
-  console.log("REQ BODY:", req.body);
+  console.log("REQ BODY:", req.body || {});
 
   try {
-    const { token, userId, companyId, role, roleExperience, clientInfo } =
-      req.body;
+    const { token, userId, companyId, role, roleExperience, clientInfo } = req.body || {};
 
     if (!token || !userId || !companyId) {
-      console.log("❌ MISSING FIELDS:", { token, userId, companyId });
+      console.log("❌ MISSING FIELDS:", { tokenPresent: !!token, userId, companyId });
       return res.status(400).json({ error: "Missing fields" });
     }
 
-    // Respond immediately to keep frontend fast
+    // reply quickly
     res.json({ success: true });
 
-    // Background processing (NON-BLOCKING)
+    // background processing
     setImmediate(async () => {
       try {
-        // Build payload
         const payload = {
           token,
           userId,
@@ -412,30 +325,18 @@ app.post("/register-token", async (req, res) => {
           tokenPreview: String(token).slice(0, 12) + "...",
         });
 
-        // 1) Remove any OTHER tokens for this same user (strict single-device mode)
-        //    This will prevent multiple active tokens per user and thus duplicate notifications.
+        // delete other tokens for same user (strict single-device)
         try {
-          const delRes = await Token.deleteMany({
-            userId,
-            token: { $ne: token },
-          });
+          const delRes = await Token.deleteMany({ userId, token: { $ne: token } });
           if (delRes && delRes.deletedCount) {
-            console.log(
-              `🗑 Removed ${delRes.deletedCount} old token(s) for user ${userId}`
-            );
+            console.log(`🗑 Removed ${delRes.deletedCount} old token(s) for user ${userId}`);
           }
         } catch (delErr) {
           console.warn("⚠ Could not delete old tokens for user:", delErr);
         }
 
-        // 2) Upsert the current token record (create or update)
-        // Use $set to avoid accidental overwrites
-        await Token.updateOne(
-          { token },
-          { $set: payload },
-          { upsert: true }
-        );
-
+        // upsert token
+        await Token.updateOne({ token }, { $set: payload }, { upsert: true });
         console.log("✔ (BG) Token stored successfully (strict mode)");
       } catch (bgErr) {
         console.error("🔥 (BG) Error storing token:", bgErr);
@@ -449,30 +350,20 @@ app.post("/register-token", async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------
-// LOGOUT TOKEN
-// ---------------------------------------------------------
+// -------------------- API: logout-token --------------------
 app.post("/logout-token", async (req, res) => {
-  const { userId, token } = req.body;
-
+  const { userId, token } = req.body || {};
   try {
     if (token) await Token.updateOne({ token }, { enabled: false });
     if (userId) await Token.updateMany({ userId }, { enabled: false });
   } catch (err) {
     console.error("🔥 LOGOUT TOKEN ERROR:", err);
   }
-
   res.json({ success: true });
 });
 
-// ---------------------------------------------------------
-// HEALTH CHECK
-// ---------------------------------------------------------
+// -------------------- health --------------------
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// ---------------------------------------------------------
-// START SERVER
-// ---------------------------------------------------------
-app.listen(PORT, () =>
-  console.log(`🚀 Catination Push Server running on PORT ${PORT}`)
-);
+// -------------------- start --------------------
+app.listen(PORT, () => console.log(`🚀 Catination Push Server running on PORT ${PORT}`));
