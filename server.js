@@ -1,4 +1,4 @@
-/** 
+/**
  * Catination Push Server — FINAL 2025 VERSION (PATCHED)
  * - Original behavior preserved
  * - Added deduplication for:
@@ -103,9 +103,12 @@ function chunkArray(arr, size) {
 }
 
 // ---------------------------------------------------------
- // DEDUPLICATION HELPERS (new)
-const recentLeads = new Map(); 
-const RECENT_LEAD_TTL = 20 * 1000;
+// DEDUPLICATION HELPERS (new)
+//  - recentLeads: short TTL cache for leadId -> prevents processing same lead repeatedly
+//  - normalizes tokens to unique list before sending to FCM
+// ---------------------------------------------------------
+const recentLeads = new Map(); // leadId -> timestamp(ms)
+const RECENT_LEAD_TTL = 20 * 1000; // 20 seconds (tune if needed)
 
 function markLeadProcessed(leadId) {
   if (!leadId) return;
@@ -117,10 +120,11 @@ function isLeadRecentlyProcessed(leadId) {
   const ts = recentLeads.get(String(leadId));
   if (!ts) return false;
   if (Date.now() - ts < RECENT_LEAD_TTL) return true;
-  recentLeads.delete(leadId);
+  recentLeads.delete(String(leadId));
   return false;
 }
 
+// periodic cleanup to avoid memory growth
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of recentLeads) {
@@ -129,29 +133,34 @@ setInterval(() => {
 }, 30000);
 
 // ---------------------------------------------------------
-// PUSH NOTIFICATIONS (PATCHED + ACCEPT BUTTON POST METHOD)
+// PUSH NOTIFICATIONS (patched)
+//  - removes falsy tokens, dedupes tokens
+//  - sends ONLY leadId, leadName, source in data
 // ---------------------------------------------------------
 async function sendPushToTokens(data, tokens) {
+  // Defensive normalization: remove falsy tokens and dedupe
   const normalized = Array.from(new Set((tokens || []).filter(Boolean)));
   if (!normalized.length) return;
 
   const ICON = "https://app.catination.com/catination-app-logo.png";
 
-  const title = `🔥 New Lead — ${data.source || "Lead"}`;
-  const body = `${data.name || ""} ${data.phone || ""} ${data.propertyName || ""}`.trim();
+  // Build only the required fields
   const leadId = String(data.leadId || "");
+  const leadName = String(data.name || "");
+  const source = String(data.source || "");
 
-  const acceptUrl = `https://api.catination.com/api/employee/assignLead/${leadId}`;
+  // Visible notification text per your request:
+  const title = `🔥 New Lead — ${source || "Lead"}`;
+  const body = leadName || "New Lead";
 
   const msgBase = {
     notification: { title, body },
 
+    // << ONLY THESE THREE FIELDS IN data >>
     data: {
       leadId,
-      name: String(data.name || ""),
-      phone: String(data.phone || ""),
-      property: String(data.propertyName || ""),
-      acceptUrl,  // ⭐ added
+      leadName,
+      source,
     },
 
     android: {
@@ -160,14 +169,8 @@ async function sendPushToTokens(data, tokens) {
         title,
         body,
         icon: ICON,
-        sound: "default",
+        sound: "default", // Android respects channel sound too; client must create channel properly
         channelId: "catination_leads",
-        actions: [
-          {
-            action: "accept",
-            title: "Accept",
-          },
-        ],
       },
     },
 
@@ -177,7 +180,6 @@ async function sendPushToTokens(data, tokens) {
         aps: {
           alert: { title, body },
           sound: "default",
-          category: "ACCEPT_CATEGORY",
         },
       },
     },
@@ -192,17 +194,9 @@ async function sendPushToTokens(data, tokens) {
         vibrate: [200, 100, 200],
         renotify: true,
         requireInteraction: true,
-        actions: [
-          {
-            action: "accept",
-            title: "Accept",
-          },
-        ],
         tag: "catination_notification",
       },
-      fcmOptions: {
-        link: acceptUrl,
-      },
+      // intentionally no fcmOptions.link included
     },
   };
 
@@ -219,6 +213,7 @@ async function sendPushToTokens(data, tokens) {
         `📨 Push sent → success:${res.successCount} failed:${res.failureCount}`
       );
 
+      // Cleanup invalid tokens
       res.responses.forEach((r, i) => {
         if (!r.success) {
           const err = r.error || {};
@@ -237,13 +232,15 @@ async function sendPushToTokens(data, tokens) {
         }
       });
     } catch (err) {
-      console.error("🔥 FCM Send Error:", err?.message || err);
+      console.error("🔥 FCM Send Error:", err && err.message ? err.message : err);
     }
   }
 }
 
 // ---------------------------------------------------------
 // LEAD EVENT HANDLER (patched)
+//  - dedupe by leadId (recentLeads)
+//  - dedupe tokens from DB
 // ---------------------------------------------------------
 async function handleLeadEvent(data) {
   try {
@@ -260,25 +257,30 @@ async function handleLeadEvent(data) {
 
     const leadId = data.leadId ? String(data.leadId) : null;
     if (leadId && isLeadRecentlyProcessed(leadId)) {
-      console.log(`⏭ Duplicate lead ignored (recent): ${leadId}`);
+      console.log(`⏭ Duplicate lead event ignored (recent): ${leadId}`);
       return;
     }
 
+    // Fetch tokens for the company
     const allTokens = await Token.find({
       companyId: String(data.companyId),
       enabled: true,
     }).lean();
 
+    // Build unique token set (dedupe identical tokens)
     const tokenSet = new Set();
+
     allTokens.forEach((t) => {
       if (!t || !t.token) return;
-      if (t.role === "ADMIN") tokenSet.add(t.token);
+      // keep same logic for target selection
+      if (t.role === "ADMIN") tokenSet.add(String(t.token));
       if (t.role === "EMPLOYEE" && String(t.roleExperience) === "1")
-        tokenSet.add(t.token);
+        tokenSet.add(String(t.token));
     });
 
     const targets = Array.from(tokenSet).filter(Boolean);
-    console.log("🎯 TARGET TOKENS:", targets.length);
+
+    console.log("🎯 TARGET TOKENS (deduped):", targets.length);
 
     if (targets.length === 0) {
       if (leadId) markLeadProcessed(leadId);
@@ -287,6 +289,7 @@ async function handleLeadEvent(data) {
 
     await sendPushToTokens(data, targets);
 
+    // Mark processed to avoid immediate duplicate handling
     if (leadId) markLeadProcessed(leadId);
   } catch (err) {
     console.error("handleLeadEvent ERROR:", err);
@@ -356,18 +359,21 @@ async function startSSE() {
     console.error("❌ SSE Connection Error:", err.message);
   }
 
-  console.log("⚠ SSE Closed — reconnecting...");
+  console.log("⚠ SSE Closed — reconnecting soon...");
   sseRunning = false;
 
   reconnectDelay = Math.min(reconnectDelay * 1.4, MAX_DELAY);
   setTimeout(startSSE, reconnectDelay);
 }
 
-// Start SSE
+// Start SSE on boot
 startSSE();
 
 // ---------------------------------------------------------
-// REGISTER TOKEN
+// REGISTER TOKEN (Matches frontend firebase.js)
+// ---------------------------------------------------------
+// ---------------------------------------------------------
+// 🚀 SUPER-OPTIMIZED REGISTER TOKEN (FAST RESPONSE + ASYNC WRITE)
 // ---------------------------------------------------------
 app.post("/register-token", async (req, res) => {
   console.log("\n🔥 /register-token HIT");
@@ -382,29 +388,42 @@ app.post("/register-token", async (req, res) => {
       return res.status(400).json({ error: "Missing fields" });
     }
 
-    const payload = {
-      token,
-      userId,
-      companyId,
-      role: role || "",
-      roleExperience: roleExperience || "0",
-      enabled: true,
-      clientInfo: clientInfo || {},
-      lastSeen: new Date(),
-    };
+    // ⭐ Respond IMMEDIATELY (NON-BLOCKING)
+    // This fixes all login delay & Render queue spikes
+    res.json({ success: true });
 
-    console.log("📝 UPSERT:", payload);
+    // 🧵 Background processing (NON-BLOCKING)
+    setImmediate(async () => {
+      try {
+        const payload = {
+          token,
+          userId,
+          companyId,
+          role: role || "",
+          roleExperience: roleExperience || "0",
+          enabled: true,
+          clientInfo: clientInfo || {},
+          lastSeen: new Date(),
+        };
 
-    await Token.updateOne({ token }, payload, { upsert: true });
+        console.log("📝 (BG) Upserting Token:", payload);
 
-    console.log("✅ TOKEN STORED SUCCESSFULLY");
+        await Token.updateOne({ token }, payload, { upsert: true });
 
-    return res.json({ success: true });
+        console.log("✔ (BG) Token stored successfully");
+      } catch (bgErr) {
+        console.error("🔥 (BG) Error storing token:", bgErr);
+      }
+    });
+
   } catch (err) {
-    console.error("🔥 REGISTER ERROR:", err);
-    return res.status(500).json({ error: err.message });
+    console.error("🔥 REGISTER ERROR (OUTER):", err);
+    if (!res.headersSent) {
+      return res.status(500).json({ error: err.message });
+    }
   }
 });
+
 
 // ---------------------------------------------------------
 // LOGOUT TOKEN
