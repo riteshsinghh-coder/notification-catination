@@ -104,22 +104,30 @@ setInterval(() => {
   }
 }, 30000);
 
-// -------------------- Push sending --------------------
 async function sendPushToTokens(data, tokens) {
   const normalized = Array.from(new Set((tokens || []).filter(Boolean)));
   if (!normalized.length) return;
 
   const ICON = "https://app.catination.com/catination-app-logo.png";
-  const leadId = String(data.leadId || "");
-  const leadName = String(data.name || data.leadName || "");
-  const source = String(data.source || "");
 
-  const title = `🔥 New Lead — ${source || "Lead"}`;
-  const body = leadName || "New Lead";
+  const leadId = String(data.leadId || "");
+  const leadName = String(data.leadName || data.name || "New Lead");
+  const source = String(data.source || "Lead");
+
+  const title = `🔥 New Lead — ${source}`;
+  const body = leadName;
 
   const msgBase = {
-    notification: { title, body },
-    data: { leadId, leadName, source },
+    notification: {
+      title,
+      body,
+    },
+
+    data: {
+      leadId,
+      leadName,
+      source,
+    },
 
     android: {
       priority: "high",
@@ -134,7 +142,13 @@ async function sendPushToTokens(data, tokens) {
 
     apns: {
       headers: { "apns-priority": "10" },
-      payload: { aps: { alert: { title, body }, sound: "default" } },
+      payload: {
+        aps: {
+          alert: { title, body },
+          sound: "default",
+          // iOS actions not supported without custom categories – skip
+        },
+      },
     },
 
     webpush: {
@@ -148,6 +162,18 @@ async function sendPushToTokens(data, tokens) {
         renotify: true,
         requireInteraction: true,
         tag: "catination_notification",
+
+        // ⭐⭐⭐ ACTION BUTTONS HERE
+        actions: [
+          {
+            action: "accept_lead",
+            title: "Accept",
+          },
+          {
+            action: "reject_lead",
+            title: "Reject",
+          },
+        ],
       },
     },
   };
@@ -160,24 +186,25 @@ async function sendPushToTokens(data, tokens) {
         tokens: batch,
       });
 
-      console.log(`📨 Push sent → success:${res.successCount} failed:${res.failureCount}`);
+      console.log(
+        `📨 Push sent → success:${res.successCount} failed:${res.failureCount}`
+      );
 
-      // remove invalid tokens
       res.responses.forEach((r, i) => {
         if (!r.success) {
           const err = r.error || {};
           const bad = batch[i];
-          console.log("❌ Invalid Token:", bad, err.code);
+
           if (
             err.code === "messaging/invalid-registration-token" ||
             err.code === "messaging/registration-token-not-registered"
           ) {
-            Token.deleteOne({ token: bad }).catch((e) => console.log("❌ Delete error:", e));
+            Token.deleteOne({ token: bad }).catch(() => {});
           }
         }
       });
     } catch (err) {
-      console.error("🔥 FCM Send Error:", err && err.message ? err.message : err);
+      console.error("🔥 FCM Send Error:", err.message || err);
     }
   }
 }
